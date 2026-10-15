@@ -1,7 +1,7 @@
 """
 title: HolmesGPT
 author: AI Investigation POC
-version: 1.0.0
+version: 1.0.2
 license: MIT
 description: Cancellation-safe Open WebUI 0.11.0 Pipe for HolmesGPT 0.43.0.
 requirements: httpx
@@ -100,7 +100,38 @@ def _json_payload(raw: str) -> Any:
 
 
 def _sanitize_answer(text: str) -> str:
-    """Remove Holmes-only rendering markers that OpenWebUI cannot resolve."""
+    """Remove model reasoning and Holmes-only markers from user-visible text."""
+    # Prefer an explicit final block when a reasoning model supplies one.
+    final_match = re.search(r"<final\b[^>]*>(.*?)</final>", text, flags=re.IGNORECASE | re.DOTALL)
+    if final_match:
+        text = final_match.group(1)
+
+    # Some OpenAI-compatible reasoning models may place reasoning tags in the
+    # content string. This transport stays provider-agnostic and removes those
+    # tags only at the final Holmes-to-OpenWebUI boundary.
+    text = re.sub(
+        r"<think\b[^>]*>.*?</think>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(
+        r"<reasoning\b[^>]*>.*?</reasoning>",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    # Some providers omit the opening tag while retaining the closing tag.
+    for closing_tag in ("</think>", "</reasoning>"):
+        closing_index = text.lower().rfind(closing_tag)
+        if closing_index >= 0:
+            text = text[closing_index + len(closing_tag) :]
+    # If a reasoning block was truncated before its closing tag, preserve only
+    # content that appeared before it; never expose the unterminated reasoning.
+    opening_match = re.search(r"<(?:think|reasoning)\b[^>]*>", text, flags=re.IGNORECASE)
+    if opening_match:
+        text = text[: opening_match.start()]
+
     text = re.sub(r"!\[[^\]]*\]\(tool-image://[^)]*\)", "", text)
     text = re.sub(r"<img\b[^>]*>", "", text, flags=re.IGNORECASE)
     text = re.sub(r"<<\[.*?\]>>", "", text, flags=re.DOTALL)
@@ -384,12 +415,28 @@ def _progress_message(tool_name: str) -> str:
 
 
 def _final_analysis(payload: Any) -> str | None:
+    """Extract only the terminal assistant answer from Holmes 0.43.0."""
     if not isinstance(payload, dict):
         return None
     analysis = payload.get("analysis")
     if isinstance(analysis, str) and analysis.strip():
         sanitized = _sanitize_answer(analysis)
-        return sanitized or None
+        if sanitized:
+            return sanitized
+
+    # Holmes' terminal SSE also contains its complete conversation history.
+    # This is the safest fallback when the top-level analysis field is empty or
+    # has been polluted with provider-specific reasoning tags.
+    history = payload.get("conversation_history") or payload.get("messages")
+    if isinstance(history, list):
+        for message in reversed(history):
+            if not isinstance(message, dict) or message.get("role") != "assistant":
+                continue
+            content = _message_text(message.get("content"))
+            if content.strip():
+                sanitized = _sanitize_answer(content)
+                if sanitized:
+                    return sanitized
     return None
 
 
@@ -551,6 +598,8 @@ class Pipe:
         queue_high_water = 0
         event_counts: Counter[str] = Counter()
         token_usage: dict[str, Any] = {}
+        finish_reason = "-"
+        final_chars = 0
         reader_task: asyncio.Task[None] | None = None
 
         request_body, has_files = _build_holmes_request(body, __files__)
@@ -682,13 +731,10 @@ class Pipe:
                             done=False,
                         )
                     elif event_type == HOLMES_AI_MESSAGE:
-                        # In Holmes 0.43.0 this is intermediate content/reasoning,
-                        # not the final answer. Never append it to assistant text.
-                        await self._emit_status(
-                            __event_emitter__,
-                            "Analyzing collected evidence…",
-                            done=False,
-                        )
+                        # This event is an intermediate tool-loop message and may
+                        # contain a provider-neutral Holmes reasoning field. Do not
+                        # emit its text, reasoning, or an event-per-iteration status.
+                        pass
                     elif event_type == HOLMES_TOKEN_COUNT:
                         if isinstance(payload, dict):
                             metadata_payload = payload.get("metadata")
@@ -710,9 +756,25 @@ class Pipe:
                         )
                     elif event_type == HOLMES_FINAL:
                         final_event_at = time.monotonic()
+                        if isinstance(payload, dict):
+                            final_metadata = payload.get("metadata")
+                            if isinstance(final_metadata, dict):
+                                raw_finish_reason = final_metadata.get("finish_reason")
+                                if isinstance(raw_finish_reason, str):
+                                    finish_reason = raw_finish_reason
                         final_answer = _final_analysis(payload)
+                        final_chars = len(final_answer) if final_answer else 0
                         if not final_answer:
-                            terminal_error = "HolmesGPT finished without a valid final analysis."
+                            if finish_reason == "length":
+                                terminal_error = (
+                                    "HolmesGPT used its output budget before producing a final answer. "
+                                    "Increase the model output-token limit or reduce conversation history."
+                                )
+                            else:
+                                terminal_error = (
+                                    "HolmesGPT finished without a user-visible final answer. "
+                                    "The reasoning output was intentionally not exposed."
+                                )
                         terminal_event = True
                     elif event_type == HOLMES_APPROVAL:
                         terminal_error = (
@@ -813,13 +875,15 @@ class Pipe:
                     int((final_event_at - started) * 1000) if final_event_at else -1
                 )
                 logger.info(
-                    "HOLMES_PIPE end request_id=%s outcome=%s total_ms=%d headers_ms=%d first_event_ms=%d final_event_ms=%d heartbeats=%d queue_high_water=%d events=%s prompt_tokens=%s completion_tokens=%s",
+                    "HOLMES_PIPE end request_id=%s outcome=%s total_ms=%d headers_ms=%d first_event_ms=%d final_event_ms=%d finish_reason=%s final_chars=%d heartbeats=%d queue_high_water=%d events=%s prompt_tokens=%s completion_tokens=%s",
                     request_id,
                     outcome,
                     total_ms,
                     headers_ms,
                     first_event_ms,
                     final_event_ms,
+                    finish_reason,
+                    final_chars,
                     heartbeat_count,
                     queue_high_water,
                     dict(event_counts),
